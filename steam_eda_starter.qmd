@@ -1,0 +1,336 @@
+---
+title: "Steam Games: Data Collection and First EDA"
+author: "Aryan Jain and William "
+format: html
+execute:
+  warning: false
+  message: false
+---
+
+## 1. Set up
+
+Run this one time in your R console if needed:
+
+```r
+install.packages(c("tidyverse", "httr2", "jsonlite"))
+```
+
+```{r}
+library(tidyverse)
+library(httr2)
+library(jsonlite)
+
+`%||%` <- function(x, default) if (is.null(x)) default else x
+
+# PILOT ONLY: these are examples, not a representative sample.
+
+# to replace with the finalized game list later
+game_ids <- c(1091500, 1172470, 1245620, 1086940)
+```
+
+## 2. Collect game information from Steam
+
+`appid` is the unique Steam game ID. We collect the game's name, release date,
+price, genre and free-to-play status.
+
+```{r}
+get_game <- function(id) {
+  raw <- request("https://store.steampowered.com/api/appdetails") |>
+    req_url_query(appids = id, cc = "us", l = "english") |>
+    req_perform() |>
+    resp_body_json(simplifyVector = FALSE)
+
+  result <- raw[[as.character(id)]]
+  if (!isTRUE(result$success)) return(NULL)
+  g <- result$data
+
+  # Genres are a list, so combine them into one text field.
+  genre_names <- map_chr(g$genres %||% list(),
+                         ~ .x$description %||% "")
+
+  tibble(
+    appid = id,
+    name = g$name %||% NA_character_,
+    release_date = g$release_date$date %||% NA_character_,
+    genres = paste(genre_names, collapse = ", "),
+    free_to_play = g$is_free %||% NA,
+    price_usd = if (isTRUE(g$is_free)) 0 else
+      (g$price_overview$final %||% NA_real_) / 100
+  )
+}
+
+# A short pause avoids sending many requests all at once.
+games <- map_dfr(game_ids, function(id) {
+  Sys.sleep(1)
+  get_game(id)
+})
+
+glimpse(games)
+write_csv(games, "steam_games.csv")
+
+
+```
+
+## 3. Collect a small sample of recent reviews
+
+This uses Steam's **current GetAppReviews service**, not the older, deprecated
+`/appreviews` endpoint. One request returns up to 100 reviews per game.
+For now, collect only English-language reviews and do not store reviewer IDs.
+
+```{r}
+get_reviews <- function(id) {
+  options <- list(
+    appid = as.integer(id),
+    filter = 1L,             # 1 = most recently created
+    review_type = 0L,        # 0 = positive AND negative
+    purchase_type = 1L,      # 1 = all purchase sources
+    languages = list("english"),
+    num_per_page = 100L
+  )
+
+  raw <- request("https://api.steampowered.com/IUserReviewsService/GetAppReviews/v1/") |>
+    req_url_query(input_json = as.character(toJSON(options, auto_unbox = TRUE))) |>
+    req_perform() |>
+    resp_body_json(simplifyVector = FALSE)
+
+  # Steam's Web API may return a "response" wrapper.
+  data <- raw$response %||% raw
+  items <- data$reviews %||% list()
+  if (length(items) == 0) return(tibble())
+
+  map_dfr(items, function(r) {
+    tibble(
+      appid = id,
+      review_date = as.Date(as.POSIXct(
+        as.numeric(r$timestamp_created %||% NA_real_),
+        origin = "1970-01-01", tz = "UTC"
+      )),
+      positive = r$voted_up %||% NA,
+      playtime_hours = (r$author$playtime_at_review %||% NA_real_) / 60,
+      review_text = r$review %||% NA_character_
+    )
+  })
+}
+
+reviews <- map_dfr(game_ids, function(id) {
+  Sys.sleep(1)
+  get_reviews(id)
+})
+
+glimpse(reviews)
+write_csv(reviews, "steam_reviews_sample.csv")
+
+
+```
+
+## 4. First EDA
+
+**Data quality:** how many observations and missing values?
+
+```{r}
+cat("Games:", nrow(games), "\n")
+cat("Reviews:", nrow(reviews), "\n")
+
+reviews |>
+  summarise(across(everything(), ~ sum(is.na(.x))))
+```
+
+**Question 1:** What percent of our *sampled recent reviews* is positive for each game?
+
+```{r}
+review_summary <- reviews |>
+  group_by(appid) |>
+  summarise(
+    n_sampled = n(),
+    positive_pct = 100 * mean(positive, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  left_join(games |> select(appid, name), by = "appid")
+
+review_summary
+
+ggplot(review_summary, aes(x = reorder(name, positive_pct), y = positive_pct)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Positive Reviews in Our Recent Sample",
+       x = "Game", y = "Positive reviews (%)") +
+  theme_minimal()
+```
+
+**Question 2:** How many hours had reviewers played when they posted their review?
+
+```{r}
+reviews |>
+  filter(!is.na(playtime_hours), playtime_hours > 0) |>
+  ggplot(aes(x = playtime_hours)) +
+  geom_histogram(bins = 30) +
+  scale_x_log10() +
+  labs(title = "Playtime at Review (Log Scale)",
+       x = "Hours played at time of review", y = "Reviews") +
+  theme_minimal()
+```
+
+## 5. Limitations and next steps
+
+- These four games are a convenience pilot, not a final unbiased sample.
+- Reviews are the most recent ~100 English reviews per game, not all-time review
+  sentiment or a random sample. Do not treat the sampled percentage as lifetime
+  positive-review percentage.
+- `price_usd` is the current US store price, not the launch price.
+- Historical monthly concurrent-player data is not included yet. Once we add
+  SteamCharts (or another historical source), we can examine how player counts
+  change over the first 12–24 months after release.
+- Respect Steam's rate limits. If you receive an HTTP 429 or access error,
+  stop and try again later rather than repeatedly retrying.
+- Do not publish raw identifiable review text or Steam user IDs.
+
+
+
+
+
+
+```{r}
+
+get_game <- function(id) {
+raw <- request("https://store.steampowered.com/api/appdetails") |>
+    req_url_query(appids = id, cc = "us", l = "english") |>
+    req_perform() |>
+    resp_body_json(simplifyVector = FALSE)
+}
+
+
+for (i in 1:100)
+{
+  print(get_game(i))
+}
+
+
+
+```
+
+
+
+```{r}
+
+library(httr2)
+
+get_game <- function(id) {
+  # Wrap in tryCatch to handle missing/invalid IDs gracefully
+  tryCatch({
+    res <- request("https://store.steampowered.com/api/appdetails") |> 
+      req_url_query(appids = id, cc = "us", l = "english") |> 
+      req_retry(max_tries = 3, backoff = ~ 2) |> # Automatically handles rate limits (429s)
+      req_perform()
+    
+    resp_body_json(res, simplifyVector = FALSE)
+  }, error = function(e) {
+    message(paste("Error fetching ID:", id, "-", e$message))
+    return(NULL)
+  })
+}
+
+# Loop with a built-in delay
+for (i in 1:100) {
+  print(paste("Fetching game:", i))
+  game_data <- get_game(i)
+  print(game_data)
+  
+  # Pause for 1.5 seconds between requests to respect Steam's servers
+  Sys.sleep(1.5) 
+}
+Use code with caution.
+
+🛠️ Key Improvements Made:
+
+• Added Sys.sleep(1.5): Pauses the loop for 1.5 seconds after each request to stay well under Steam's rate limit
+
+
+```
+
+
+
+
+##6. Questions:
+
+- I have access and a sample of the steam games and have looked into the data
+to extract reviews, playtime, steamID #, name, release date, genre, price, etc.
+
+- still want to look into steamCharts next for historical monthly player data
+
+
+- at the moment I'm trying to figure out what games we should use
+- i assumed it makes more sense, as to reduce randomness / variation, that we
+could use games released in 2020 and compare their general longevity. So we can
+look at games that flopped and games that lasted, all starting from 2020 where 
+streaming / general longevity conditons where all on an equal field. For example, 
+twitch wasn't around in 2010, so steam games from back then often wouldn't last as long,
+or they wouldn't be as often in and out of main stream as they are now. 
+
+
+
+
+
+
+
+
+```{r}
+
+library(httr2)
+
+get_game_name_2020 <- function(id) {
+  tryCatch({
+    res <- request("https://store.steampowered.com/api/appdetails") |> 
+      req_url_query(appids = id, cc = "us", l = "english") |> 
+      req_retry(max_tries = 3, backoff = ~ 2) |> 
+      req_perform()
+    
+    body <- resp_body_json(res, simplifyVector = FALSE)
+    id_str <- as.character(id)
+    
+    # Check if the API successfully returned data for this AppID
+    if (!is.null(body[[id_str]]) && body[[id_str]]$success == TRUE) {
+      game_data <- body[[id_str]]$data
+      
+      # Extract name and release date text
+      game_name    <- game_data$name
+      release_date <- game_data$release_date$date
+      
+      # Filter for dates containing the year "2020"
+      if (!is.null(release_date) && grepl("2020", release_date)) {
+        return(game_name)
+      }
+    }
+    return(NULL)
+  }, error = function(e) {
+    return(NULL)
+  })
+}
+
+# Vector to store our matching game names
+games_2020 <- c()
+
+# Loop through the first 100 AppIDs
+for (i in 1:100) {
+  name <- get_game_name_2020(i)
+  
+  if (!is.null(name)) {
+    print(paste("Found 2020 game:", name))
+    games_2020 <- c(games_2020, name)
+  }
+  
+  Sys.sleep(1.5) # Maintain a safe rate limit to avoid 429 errors
+}
+
+# Print final filtered list
+print("--- 2020 Games Found ---")
+print(games_2020)
+
+
+
+
+```
+
+
+
+
+
